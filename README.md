@@ -1,4 +1,9 @@
-# PredictionBot
+# PredictionBot 🤖
+
+[![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![React](https://img.shields.io/badge/React-20232A?style=flat&logo=react&logoColor=61DAFB)](https://reactjs.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-339933?style=flat&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
+[![TON](https://img.shields.io/badge/TON-0088CC?style=flat&logo=ton&logoColor=white)](https://ton.org/)
 
 Мини-приложение в Telegram для торговли прогнозами (YES/NO рынки) с использованием TON блокчейна.
 
@@ -53,7 +58,17 @@ npm install
 
 ## 📖 Документация
 
-Полная спецификация проекта: [PROJECT_SPECIFICATION.md](./PROJECT_SPECIFICATION.md)
+- **[Полная спецификация проекта](./PROJECT_SPECIFICATION.md)** - детальное описание архитектуры, API и бизнес-логики
+- **[Инструкция по установке](./SETUP.md)** - пошаговая настройка всех компонентов
+- **[Прогресс разработки](./PROGRESS.md)** - текущий статус проекта
+- **[Следующие шаги](./NEXT_STEPS.md)** - план дальнейшей разработки
+
+## 🔧 Технологии
+
+- **Frontend**: React 18, TypeScript, Vite, TonConnect UI, Zustand, Tailwind CSS
+- **Backend**: Node.js, Express, TypeScript, PostgreSQL, Redis
+- **Blockchain**: TON, FunC, TON SDK
+- **Tools**: ESLint, Prettier, Winston (логирование)
 
 ## 🔐 Комиссии
 
