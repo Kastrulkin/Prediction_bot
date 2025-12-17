@@ -1,0 +1,11 @@
+#include "../imports/stdlib.fc";
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    cell dict = null();
+    slice sender = sender_address();
+    int key = slice_hash(sender);
+    
+    var (val, found) = udict_get_ref?(dict, 256, key);
+    dict = udict_set_ref(dict, 256, key, begin_cell().store_uint(100, 32).end_cell());
+}
+

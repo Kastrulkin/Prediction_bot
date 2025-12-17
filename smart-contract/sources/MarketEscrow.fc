@@ -1,0 +1,298 @@
+;; MarketEscrow Smart Contract для PredictionBot
+;; Один контракт на один рынок - хранит ставки и распределяет выплаты
+
+#include "../imports/stdlib.fc";
+
+;; Константы
+(int) min_bet() inline { return 100000000; } ;; 0.1 TON в nanotons
+(int) max_bet() inline { return 100000000000; } ;; 100 TON в nanotons
+(int) max_bet_percent() inline { return 20; } ;; 20% от пула
+
+;; Структура данных пользователя
+(slice, int, int) load_user_position(slice ds) inline {
+    var amount_yes = ds~load_coins();
+    var amount_no = ds~load_coins();
+    return (ds, amount_yes, amount_no);
+}
+
+(cell) store_user_position(int amount_yes, int amount_no) inline {
+    return begin_cell()
+        .store_coins(amount_yes)
+        .store_coins(amount_no)
+    .end_cell();
+}
+
+;; Структура данных контракта
+(slice, slice, int, int, int, int, int, cell) load_data() inline {
+    slice ds = get_data().begin_parse();
+    var (ds_rest, admin_address) = ds~load_msg_addr();
+    var total_yes = ds_rest~load_coins();
+    var total_no = ds_rest~load_coins();
+    var resolved_outcome = ds_rest~load_uint(2); ;; 0 = open, 1 = yes wins, 2 = no wins
+    var fee_in_bps = ds_rest~load_uint(16);
+    var fee_out_bps = ds_rest~load_uint(16);
+    var (ds_final, user_positions_dict) = ds_rest~load_dict();
+    return (ds_final, admin_address, total_yes, total_no, resolved_outcome, fee_in_bps, fee_out_bps, user_positions_dict);
+}
+
+(cell) store_data(slice admin_address, int total_yes, int total_no, int resolved_outcome, int fee_in_bps, int fee_out_bps, cell user_positions_dict) inline {
+    return begin_cell()
+        .store_slice(admin_address)
+        .store_coins(total_yes)
+        .store_coins(total_no)
+        .store_uint(resolved_outcome, 2)
+        .store_uint(fee_in_bps, 16)
+        .store_uint(fee_out_bps, 16)
+        .store_dict(user_positions_dict)
+    .end_cell();
+}
+
+;; Инициализация контракта
+() init() impure {
+    ;; Данные инициализируются через init_data в wrapper
+}
+
+;; Получение адреса отправителя из сообщения
+(slice) get_sender_address(cell in_msg_full) inline {
+    slice msg = in_msg_full.begin_parse();
+    msg~load_uint(4); ;; skip message info flags (recv_internal always has internal messages)
+    var (_, sender) = msg~load_msg_addr(); ;; load sender address
+    return sender;
+}
+
+;; Обработка входящих сообщений
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) {
+        return ();
+    }
+    
+    slice sender = get_sender_address(in_msg_full);
+    int op = in_msg_body~load_uint(32);
+    
+    if (op == 1) {
+        ;; place_bet(side, amount)
+        place_bet(in_msg_body, msg_value, sender);
+    }
+    elseif (op == 2) {
+        ;; resolve_market(outcome)
+        resolve_market(in_msg_body, sender);
+    }
+    elseif (op == 3) {
+        ;; claim_payout()
+        claim_payout(sender);
+    }
+    elseif (op == 4) {
+        ;; refund_market(refund_fee_bps)
+        refund_market(in_msg_body, sender);
+    }
+}
+
+() place_bet(slice in_msg_body, int msg_value, slice sender) impure {
+    (slice ds, slice admin_address, int total_yes, int total_no, int resolved_outcome, int fee_in_bps, int fee_out_bps, cell user_positions_dict) = load_data();
+    
+    ;; Проверка, что рынок открыт
+    throw_unless(401, resolved_outcome == 0);
+    
+    ;; Получаем параметры
+    int side = in_msg_body~load_uint(1); ;; 1 = YES, 0 = NO
+    int amount = msg_value;
+    
+    ;; Валидация минимальной/максимальной ставки
+    throw_unless(402, amount >= min_bet());
+    throw_unless(403, amount <= max_bet());
+    
+    ;; Проверка лимита на размер ставки (20% от пула)
+    int current_pool = (side == 1) ? total_yes : total_no;
+    if (current_pool > 0) {
+        int max_bet_amount = (current_pool * max_bet_percent()) / 100;
+        throw_unless(404, amount <= max_bet_amount);
+    }
+    
+    ;; Вычисляем комиссию fee_in
+    int fee_amount = (amount * fee_in_bps) / 10000;
+    int amount_net = amount - fee_amount;
+    
+    ;; Отправляем комиссию на админ-кошелек
+    if (fee_amount > 0) {
+        var msg = begin_cell()
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_slice(admin_address)
+            .store_coins(fee_amount)
+            .store_uint(0, 1 + 1 + 1 + 1 + 1 + 1 + 1)
+        .end_cell();
+        send_raw_message(msg, 1); ;; mode = 1 (pay fees separately)
+    }
+    
+    ;; Обновляем пулы
+    if (side == 1) {
+        total_yes = total_yes + amount_net;
+    } else {
+        total_no = total_no + amount_net;
+    }
+    
+    ;; Обновляем позицию пользователя
+    int sender_key = slice_hash(sender);
+    
+    var (user_pos_cell, found) = udict_get_ref?(user_positions_dict, 256, sender_key);
+    int user_yes = 0;
+    int user_no = 0;
+    if (found) {
+        slice user_pos_slice = user_pos_cell.begin_parse();
+        user_yes = user_pos_slice~load_coins();
+        user_no = user_pos_slice~load_coins();
+    }
+    
+    if (side == 1) {
+        user_yes = user_yes + amount_net;
+    } else {
+        user_no = user_no + amount_net;
+    }
+    
+    user_positions_dict = udict_set_ref(user_positions_dict, 256, sender_key, store_user_position(user_yes, user_no));
+    
+    ;; Сохраняем данные
+    set_data(store_data(admin_address, total_yes, total_no, resolved_outcome, fee_in_bps, fee_out_bps, user_positions_dict));
+}
+
+() resolve_market(slice in_msg_body, slice sender) impure {
+    (slice ds, slice admin_address, int total_yes, int total_no, int resolved_outcome, int fee_in_bps, int fee_out_bps, cell user_positions_dict) = load_data();
+    
+    ;; Проверка админа (сравниваем хеши адресов)
+    throw_unless(501, slice_hash(sender) == slice_hash(admin_address));
+    
+    ;; Проверка, что рынок еще не разрешен
+    throw_unless(502, resolved_outcome == 0);
+    
+    ;; Получаем исход
+    int outcome = in_msg_body~load_uint(1); ;; 1 = YES wins, 0 = NO wins
+    
+    ;; Edge case: пустые пулы
+    if (total_yes == 0 || total_no == 0) {
+        set_data(store_data(admin_address, total_yes, total_no, outcome, fee_in_bps, fee_out_bps, user_positions_dict));
+        return ();
+    }
+    
+    ;; Вычисляем комиссию fee_out с пула проигравших
+    int fee_amount = 0;
+    if (outcome == 1) {
+        ;; YES выигрывает, комиссия с NO пула
+        fee_amount = (total_no * fee_out_bps) / 10000;
+    } else {
+        ;; NO выигрывает, комиссия с YES пула
+        fee_amount = (total_yes * fee_out_bps) / 10000;
+    }
+    
+    ;; Отправляем комиссию на админ-кошелек
+    if (fee_amount > 0) {
+        var msg = begin_cell()
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_slice(admin_address)
+            .store_coins(fee_amount)
+            .store_uint(0, 1 + 1 + 1 + 1 + 1 + 1 + 1)
+        .end_cell();
+        send_raw_message(msg, 1);
+    }
+    
+    ;; Обновляем статус
+    set_data(store_data(admin_address, total_yes, total_no, outcome, fee_in_bps, fee_out_bps, user_positions_dict));
+}
+
+() claim_payout(slice sender) impure {
+    (slice ds, slice admin_address, int total_yes, int total_no, int resolved_outcome, int fee_in_bps, int fee_out_bps, cell user_positions_dict) = load_data();
+    
+    ;; Проверяем, что рынок разрешен
+    throw_unless(601, resolved_outcome != 0);
+    
+    ;; Получаем позицию пользователя
+    int sender_key = slice_hash(sender);
+    
+    var (user_pos_cell, found) = udict_get_ref?(user_positions_dict, 256, sender_key);
+    throw_unless(602, found); ;; Позиция должна существовать
+    
+    slice user_pos_slice = user_pos_cell.begin_parse();
+    int user_yes = user_pos_slice~load_coins();
+    int user_no = user_pos_slice~load_coins();
+    
+    ;; Вычисляем выплату
+    int payout = 0;
+    
+    if (resolved_outcome == 1 && user_yes > 0) {
+        ;; YES выиграл
+        int fee_out = (total_no * fee_out_bps) / 10000;
+        int total_pool = total_yes + total_no - fee_out;
+        
+        ;; Edge case: деление на ноль
+        throw_unless(603, total_yes > 0);
+        
+        ;; Обработка округления: умножаем сначала, потом делим
+        payout = (user_yes * total_pool) / total_yes;
+        
+        ;; Обнуляем позицию
+        user_positions_dict = udict_set_ref(user_positions_dict, 256, sender_key, store_user_position(0, user_no));
+    }
+    elseif (resolved_outcome == 2 && user_no > 0) {
+        ;; NO выиграл
+        int fee_out = (total_yes * fee_out_bps) / 10000;
+        int total_pool = total_yes + total_no - fee_out;
+        
+        ;; Edge case: деление на ноль
+        throw_unless(604, total_no > 0);
+        
+        ;; Обработка округления: умножаем сначала, потом делим
+        payout = (user_no * total_pool) / total_no;
+        
+        ;; Обнуляем позицию
+        user_positions_dict = udict_set_ref(user_positions_dict, 256, sender_key, store_user_position(user_yes, 0));
+    }
+    
+    throw_unless(605, payout > 0);
+    
+    ;; Отправляем выплату
+    var msg = begin_cell()
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_slice(sender)
+        .store_coins(payout)
+        .store_uint(0, 1 + 1 + 1 + 1 + 1 + 1 + 1)
+    .end_cell();
+    send_raw_message(msg, 1);
+    
+    ;; Сохраняем данные
+    set_data(store_data(admin_address, total_yes, total_no, resolved_outcome, fee_in_bps, fee_out_bps, user_positions_dict));
+}
+
+() refund_market(slice in_msg_body, slice sender) impure {
+    (slice ds, slice admin_address, int total_yes, int total_no, int resolved_outcome, int fee_in_bps, int fee_out_bps, cell user_positions_dict) = load_data();
+    
+    ;; Проверка админа (сравниваем хеши адресов)
+    throw_unless(701, slice_hash(sender) == slice_hash(admin_address));
+    
+    ;; Получаем комиссию для возврата
+    int refund_fee_bps = in_msg_body~load_uint(16);
+    
+    ;; TODO: Реализовать возврат средств всем пользователям
+    ;; Это требует итерации по словарю user_positions_dict
+    ;; Для MVP можно оставить упрощенную версию или использовать отдельную функцию
+    
+    ;; Обновляем статус
+    set_data(store_data(admin_address, total_yes, total_no, 3, fee_in_bps, fee_out_bps, user_positions_dict)); ;; 3 = cancelled
+}
+
+;; Get методы для чтения данных
+(int, int, int, int, int) get_market_data() method_id {
+    (slice ds, slice admin_address, int total_yes, int total_no, int resolved_outcome, int fee_in_bps, int fee_out_bps, cell user_positions_dict) = load_data();
+    return (total_yes, total_no, resolved_outcome, fee_in_bps, fee_out_bps);
+}
+
+(int, int) get_user_position(slice user_address) method_id {
+    (slice ds, slice admin_address, int total_yes, int total_no, int resolved_outcome, int fee_in_bps, int fee_out_bps, cell user_positions_dict) = load_data();
+    
+    int user_key = slice_hash(user_address);
+    var (user_pos_cell, found) = udict_get_ref?(user_positions_dict, 256, user_key);
+    if (found) {
+        slice user_pos_slice = user_pos_cell.begin_parse();
+        int user_yes = user_pos_slice~load_coins();
+        int user_no = user_pos_slice~load_coins();
+        return (user_yes, user_no);
+    }
+    return (0, 0);
+}
